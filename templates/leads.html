@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+
+{% block title %}ARIS — Leads Pipeline{% endblock %}
+{% block header_title %}Leads Pipeline & CRM{% endblock %}
+
+{% block content %}
+<div class="space-y-6 max-w-7xl mx-auto">
+    <!-- CONTROLS HEADER -->
+    <div class="glass-panel p-5 rounded-2xl flex flex-col md:flex-row gap-4 items-center justify-between">
+        <!-- Stage Filters -->
+        <div class="flex items-center gap-2 overflow-x-auto w-full md:w-auto pb-2 md:pb-0 text-xs font-medium">
+            <button onclick="filterStage('ALL')" class="stage-btn px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">All</button>
+            <button onclick="filterStage('NEW')" class="stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white">New</button>
+            <button onclick="filterStage('QUALIFYING')" class="stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white">Qualifying</button>
+            <button onclick="filterStage('PROPERTY_SHORTLISTED')" class="stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white">Shortlisted</button>
+            <button onclick="filterStage('VISIT_BOOKED')" class="stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white">Visit Booked</button>
+            <button onclick="filterStage('CONVERTED')" class="stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white">Converted</button>
+        </div>
+
+        <!-- Search Input -->
+        <div class="relative w-full md:w-72">
+            <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3 top-2.5"></i>
+            <input type="text" id="lead-search-input" onkeyup="handleSearch(event)" placeholder="Search name, WhatsApp ID..." class="w-full bg-slate-900 border border-slate-700/80 rounded-xl pl-9 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500">
+        </div>
+    </div>
+
+    <!-- LEADS TABLE -->
+    <div class="glass-panel rounded-2xl overflow-hidden">
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+                <thead class="bg-slate-900/80 border-b border-slate-800 text-slate-400 uppercase font-semibold text-[10px] tracking-wider">
+                    <tr>
+                        <th class="py-3.5 px-6">Lead / Contact</th>
+                        <th class="py-3.5 px-6">AI Score</th>
+                        <th class="py-3.5 px-6">Sales Stage</th>
+                        <th class="py-3.5 px-6">Preferences</th>
+                        <th class="py-3.5 px-6">Shortlisted</th>
+                        <th class="py-3.5 px-6">Last Active</th>
+                        <th class="py-3.5 px-6 text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="leads-table-body" class="divide-y divide-slate-800/60 text-slate-300">
+                    <tr>
+                        <td colspan="7" class="py-12 text-center text-slate-500">Loading leads...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- PAGINATION FOOTER -->
+        <div class="p-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+            <span id="pagination-info">Showing 0 leads</span>
+            <div class="flex items-center gap-2">
+                <button id="btn-prev" onclick="prevPage()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-40">Previous</button>
+                <button id="btn-next" onclick="nextPage()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-40">Next</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentStage = 'ALL';
+    let currentPage = 1;
+    let searchQuery = '';
+
+    async function loadLeads() {
+        try {
+            let url = `/api/leads?page=${currentPage}&limit=15`;
+            if (currentStage && currentStage !== 'ALL') url += `&stage=${currentStage}`;
+            if (searchQuery) url += `&search=${encodeURIComponent(searchQuery)}`;
+
+            const res = await fetch(url);
+            const data = await res.json();
+
+            renderLeads(data.leads || []);
+            renderPagination(data.pagination || {});
+        } catch (e) {
+            console.error('Error loading leads:', e);
+        }
+    }
+
+    function renderLeads(leads) {
+        const tbody = document.getElementById('leads-table-body');
+        if (!leads.length) {
+            tbody.innerHTML = '<tr><td colspan="7" class="py-12 text-center text-slate-500">No matching leads found.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = leads.map(l => {
+            const score = l.lead_score || 0;
+            let scoreBadge = 'badge-cold';
+            let scoreCategory = 'Cold';
+            if (score >= 81) { scoreBadge = 'badge-very-hot'; scoreCategory = 'Very Hot 🔥'; }
+            else if (score >= 61) { scoreBadge = 'badge-hot'; scoreCategory = 'Hot 🔥'; }
+            else if (score >= 31) { scoreBadge = 'badge-warm'; scoreCategory = 'Warm'; }
+
+            const bhkStr = (l.bhk || []).join(', ') || 'Any';
+            const cityStr = l.preferred_city || 'Not set';
+            const budgetStr = l.budget_max ? `₹${l.budget_max}L` : 'Flexible';
+            const shortlistedCount = (l.shortlisted_properties || []).length;
+            const lastActive = l.last_interaction_at ? new Date(l.last_interaction_at).toLocaleDateString() : '--';
+
+            return `
+                <tr class="hover:bg-slate-800/40 transition">
+                    <td class="py-4 px-6">
+                        <div class="font-bold text-white">${l.name || 'Valued Client'}</div>
+                        <div class="font-mono text-slate-400 text-[11px]">+${l.wa_id}</div>
+                    </td>
+                    <td class="py-4 px-6">
+                        <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${scoreBadge}">
+                            ${score} • ${scoreCategory}
+                        </span>
+                    </td>
+                    <td class="py-4 px-6">
+                        <select onchange="updateStage('${l.lead_id}', this.value)" class="bg-slate-900 border border-slate-700 text-slate-300 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-emerald-500">
+                            ${['NEW', 'QUALIFYING', 'PROPERTY_DISCOVERY', 'PROPERTY_SHORTLISTED', 'VISIT_REQUESTED', 'VISIT_BOOKED', 'VISIT_COMPLETED', 'CONVERTED', 'LOST'].map(st => `
+                                <option value="${st}" ${l.sales_stage === st ? 'selected' : ''}>${st}</option>
+                            `).join('')}
+                        </select>
+                    </td>
+                    <td class="py-4 px-6 text-slate-300">
+                        <div>📍 ${cityStr}</div>
+                        <div class="text-[11px] text-slate-400">🏡 ${bhkStr} | 💰 ${budgetStr}</div>
+                    </td>
+                    <td class="py-4 px-6">
+                        <span class="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 text-[11px] border border-slate-700">
+                            ${shortlistedCount} saved
+                        </span>
+                    </td>
+                    <td class="py-4 px-6 text-slate-400 font-mono text-[11px]">${lastActive}</td>
+                    <td class="py-4 px-6 text-right">
+                        <a href="/dashboard/leads/${l.lead_id}" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 transition text-xs font-semibold">
+                            View 360
+                            <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                        </a>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+        lucide.createIcons();
+    }
+
+    function renderPagination(pg) {
+        document.getElementById('pagination-info').innerText = `Page ${pg.page || 1} of ${pg.pages || 1} (${pg.total || 0} leads total)`;
+        document.getElementById('btn-prev').disabled = (pg.page || 1) <= 1;
+        document.getElementById('btn-next').disabled = (pg.page || 1) >= (pg.pages || 1);
+    }
+
+    function prevPage() {
+        if (currentPage > 1) {
+            currentPage--;
+            loadLeads();
+        }
+    }
+
+    function nextPage() {
+        currentPage++;
+        loadLeads();
+    }
+
+    function filterStage(stage) {
+        currentStage = stage;
+        currentPage = 1;
+        document.querySelectorAll('.stage-btn').forEach(btn => {
+            btn.className = 'stage-btn px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white';
+        });
+        event.target.className = 'stage-btn px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-semibold';
+        loadLeads();
+    }
+
+    let debounceTimeout = null;
+    function handleSearch(e) {
+        clearTimeout(debounceTimeout);
+        debounceTimeout = setTimeout(() => {
+            searchQuery = e.target.value.trim();
+            currentPage = 1;
+            loadLeads();
+        }, 350);
+    }
+
+    async function updateStage(leadId, newStage) {
+        try {
+            await fetch(`/api/leads/${leadId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sales_stage: newStage })
+            });
+            loadLeads();
+        } catch (e) {
+            alert('Failed to update stage: ' + e);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadLeads();
+        // Auto-refresh leads every 4 seconds for realtime sync
+        setInterval(() => {
+            const searchInput = document.getElementById('lead-search-input');
+            if (document.activeElement !== searchInput) {
+                loadLeads();
+            }
+        }, 4000);
+    });
+</script>
+{% endblock %}

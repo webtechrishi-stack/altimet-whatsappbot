@@ -1,0 +1,15 @@
+flask>=3.0.0
+gunicorn>=21.2.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+pymongo>=4.6.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+argon2-cffi>=23.1.0
+sentence-transformers>=2.2.2
+torch>=2.1.0
+google-genai>=0.1.1
+google-generativeai>=0.8.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.2

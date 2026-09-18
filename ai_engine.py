@@ -577,6 +577,12 @@ class SentenceTransformerEmbedder:
         self._init_model()
 
     def _init_model(self):
+        # Prevent heavy PyTorch / HF weights downloading on memory-constrained cloud environments (Railway / Render)
+        enable_local = os.getenv("ENABLE_LOCAL_TORCH", "false").lower() in ("true", "1", "yes")
+        if not enable_local:
+            logger.info("[EMBEDDER] Local PyTorch disabled to preserve RAM. Using zero-memory cloud / semantic embedding generator.")
+            return
+
         if SentenceTransformerEmbedder._model is not None:
             return
         try:
@@ -595,6 +601,24 @@ class SentenceTransformerEmbedder:
                 return vec.tolist()
             except Exception:
                 pass
+
+        # Cloud Gemini Embedding API (0 MB server RAM overhead)
+        try:
+            api_key = getattr(Config, "GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+            if api_key:
+                import google.generativeai as genai_legacy
+                genai_legacy.configure(api_key=api_key)
+                res = genai_legacy.embed_content(
+                    model="models/text-embedding-004",
+                    content=text,
+                    task_type="retrieval_query"
+                )
+                if res and "embedding" in res:
+                    emb = res["embedding"]
+                    # Normalize to 384 dimensions
+                    return emb[:384] if len(emb) >= 384 else emb + [0.0] * (384 - len(emb))
+        except Exception:
+            pass
 
         # Fallback: Deterministic semantic pseudo-embedding of length 384
         import hashlib

@@ -608,13 +608,19 @@ class MongoDB:
     def connect(self):
         """Establishes connection to MongoDB with timeouts and initializes indexes."""
         try:
-            self.client = MongoClient(
-                self.uri,
-                serverSelectionTimeoutMS=3000,
-                connectTimeoutMS=3000,
-                socketTimeoutMS=5000,
-                maxPoolSize=50
-            )
+            kwargs = {
+                "serverSelectionTimeoutMS": 10000,
+                "connectTimeoutMS": 10000,
+                "socketTimeoutMS": 15000,
+                "maxPoolSize": 50
+            }
+            try:
+                import certifi
+                kwargs["tlsCAFile"] = certifi.where()
+            except Exception:
+                pass
+
+            self.client = MongoClient(self.uri, **kwargs)
             self.db = self.client[self.db_name]
             self.client.admin.command("ping")
             self._connected = True

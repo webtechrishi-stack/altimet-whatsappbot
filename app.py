@@ -36,9 +36,17 @@ from flask import (
     g,
 )
 
-# Ensure UTF-8 output encoding on Windows console
+# Ensure UTF-8 output encoding and immediate line buffering for Railway/Docker logs
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 from config import Config
 from database import DB, get_db, serialize_doc, CampaignStatus
@@ -309,11 +317,13 @@ def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
+    print(f"[WEBHOOK GET] Handshake attempt: mode={mode}, token_matches={token == Config.VERIFY_TOKEN}", flush=True)
+
     if mode == "subscribe" and token == Config.VERIFY_TOKEN:
-        print("[VERIFICATION] Webhook verified successfully with Meta!")
+        print("[VERIFICATION] Webhook verified successfully with Meta!", flush=True)
         return Response(response=challenge, status=200, mimetype="text/plain")
 
-    print(f"[VERIFICATION FAILED] Expected: '{Config.VERIFY_TOKEN}', Got: '{token}'")
+    print(f"[VERIFICATION FAILED] Expected: '{Config.VERIFY_TOKEN}', Got: '{token}'", flush=True)
     return "Verification failed", 403
 
 
@@ -329,6 +339,7 @@ def webhook():
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     payload = request.get_json(silent=True) or {}
+    print(f"\n[WEBHOOK INCOMING POST] {request_id} received from {request.remote_addr}", flush=True)
 
     try:
         DB.webhooks.save_event(

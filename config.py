@@ -65,6 +65,13 @@ class Config:
     AGENCY_NAME = os.getenv("AGENCY_NAME", "ARIS Real Estate Advisory").strip()
     CONVERSATION_RETENTION_DAYS = int(os.getenv("CONVERSATION_RETENTION_DAYS", "365"))
 
+    # Smart Follow-Up Automation Settings (6-12 hr drip, max 2 nudges, quiet hours)
+    FOLLOWUP_MIN_HOURS = float(os.getenv("FOLLOWUP_MIN_HOURS", "6.0"))
+    FOLLOWUP_MAX_HOURS = float(os.getenv("FOLLOWUP_MAX_HOURS", "12.0"))
+    FOLLOWUP_MAX_COUNT = int(os.getenv("FOLLOWUP_MAX_COUNT", "2"))
+    FOLLOWUP_COOLDOWN_HOURS = float(os.getenv("FOLLOWUP_COOLDOWN_HOURS", "24.0"))
+    FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in ("true", "1", "yes")
+
     @classmethod
     def validate(cls):
         """

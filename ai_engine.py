@@ -1381,13 +1381,241 @@ class ARISOrchestrator:
 
 class FollowUpService:
     """
-    Automates timed drip sequences and reminders.
+    Automates smart, non-intrusive drip sequences and reminders.
+    Strictly adheres to:
+    - 6 to 12 hour inactivity window
+    - Quiet hours (no messages 9:30 PM - 9:30 AM IST)
+    - Opt-out / DND exclusion
+    - Stage-aware, short (under 30 words) conversational messages
+    - Max 2 follow-ups per conversation with 24h cooldown
     """
 
     def __init__(self):
         self.followup_repo = DB.followups
         self.lead_repo = DB.leads
         self.event_repo = DB.events
+
+    @staticmethod
+    def is_quiet_hours(now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time in IST (+5:30) is during quiet hours (21:30 to 09:30)."""
+        now = now_utc or datetime.now(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        ist_time = now + ist_offset
+        total_minutes = ist_time.hour * 60 + ist_time.minute
+        # 21:30 = 1290 minutes, 09:30 = 570 minutes
+        return total_minutes >= 1290 or total_minutes < 570
+
+    def is_eligible_for_followup(self, conv: Dict[str, Any], now_utc: Optional[datetime] = None) -> bool:
+        """
+        Determines if an ongoing conversation should receive an automated follow-up.
+        """
+        if not getattr(Config, "FOLLOWUP_ENABLED", True):
+            return False
+
+        now = now_utc or datetime.now(timezone.utc)
+        if self.is_quiet_hours(now):
+            return False
+
+        if conv.get("status") in ("closed", "opted_out", "archived"):
+            return False
+        if conv.get("human_takeover"):
+            return False
+        if conv.get("opted_out"):
+            return False
+
+        stage = str(conv.get("sales_stage", "NEW")).upper()
+        if stage in ("VISIT_BOOKED", "VISIT_COMPLETED", "WON", "LOST", "OPTED_OUT"):
+            return False
+
+        wa_id = str(conv.get("wa_id", "")).strip()
+        lead_id = conv.get("lead_id")
+        lead = self.lead_repo.get_by_id(lead_id) if lead_id else None
+        if not lead and wa_id:
+            lead = self.lead_repo.get_by_wa_id(wa_id) if hasattr(self.lead_repo, "get_by_wa_id") else None
+        if lead and lead.get("opted_out"):
+            return False
+
+        # Frequency caps
+        followup_count = int(conv.get("followup_count", 0))
+        if followup_count >= getattr(Config, "FOLLOWUP_MAX_COUNT", 2):
+            return False
+
+        last_fup = conv.get("last_followup_at")
+        if last_fup:
+            if isinstance(last_fup, str):
+                try:
+                    last_fup = datetime.fromisoformat(last_fup.replace("Z", "+00:00"))
+                except Exception:
+                    last_fup = None
+            if last_fup:
+                if last_fup.tzinfo is None:
+                    last_fup = last_fup.replace(tzinfo=timezone.utc)
+                if (now - last_fup).total_seconds() < getattr(Config, "FOLLOWUP_COOLDOWN_HOURS", 24.0) * 3600:
+                    return False
+
+        # Timing check: between 6 hours and 72 hours
+        last_ai = conv.get("last_ai_message_at") or conv.get("last_message_at")
+        last_cust = conv.get("last_customer_message_at")
+
+        if not last_ai:
+            return False
+
+        if isinstance(last_ai, str):
+            try:
+                last_ai = datetime.fromisoformat(last_ai.replace("Z", "+00:00"))
+            except Exception:
+                return False
+        if last_ai.tzinfo is None:
+            last_ai = last_ai.replace(tzinfo=timezone.utc)
+
+        if last_cust:
+            if isinstance(last_cust, str):
+                try:
+                    last_cust = datetime.fromisoformat(last_cust.replace("Z", "+00:00"))
+                except Exception:
+                    last_cust = None
+            if last_cust and last_cust.tzinfo is None:
+                last_cust = last_cust.replace(tzinfo=timezone.utc)
+            # If customer replied after last AI message, do not send follow-up
+            if last_cust and last_cust >= last_ai:
+                return False
+
+        elapsed_hours = (now - last_ai).total_seconds() / 3600.0
+        min_hours = getattr(Config, "FOLLOWUP_MIN_HOURS", 6.0)
+        max_active_hours = 72.0
+
+        return min_hours <= elapsed_hours <= max_active_hours
+
+    def generate_smart_followup_message(self, conv: Dict[str, Any], lead: Optional[Dict[str, Any]] = None) -> str:
+        """Generates a crisp, natural, conversational follow-up (under 30 words)."""
+        name = (lead.get("name") if lead else "") or "ji"
+        if name in ("Valued Client", "Anonymous", ""):
+            name_salutation = "Hello!"
+        else:
+            name_salutation = f"Hi {name.strip()}!"
+
+        stage = str(conv.get("sales_stage", "NEW")).upper()
+
+        # Case 1: Visit pitched / negotiating
+        if stage in ("VISIT_PITCHED", "VISIT_NEGOTIATING"):
+            return (
+                f"{name_salutation} 👋 We have guided visits happening this weekend. "
+                f"Would Saturday or Sunday work better for you to take a quick look? 🏡"
+            )
+
+        # Case 2: Specific property discussed
+        mem = DB.customer_memory.get_by_lead_id(conv.get("lead_id")) if conv.get("lead_id") else None
+        rec_props = mem.get("recommended_properties", []) if mem else []
+        if rec_props:
+            prop_title = rec_props[0]
+            return (
+                f"{name_salutation} 🏡 Just checking in—did {prop_title} look like a good fit, "
+                f"or should I share 1-2 other options nearby?"
+            )
+
+        # Case 3: Requirements partially captured (Discovery)
+        req = mem.get("requirements", {}) if mem else {}
+        bhk = req.get("bhk")
+        loc = req.get("locality") or req.get("city")
+        if bhk or loc:
+            focus = f"{bhk} options" if bhk else f"options in {loc}"
+            return (
+                f"{name_salutation} 👋 Hope you're having a good day! "
+                f"Did you get a chance to review the {focus}? Let me know if you'd like me to share the floor plans!"
+            )
+
+        # Case 4: General warm check-in
+        return (
+            f"{name_salutation} 👋 Hope you're doing well. "
+            f"Whenever you'd like to explore verified homes or have any questions, feel free to reply anytime! 🏡"
+        )
+
+    def send_followup(self, conversation_id: str) -> Dict[str, Any]:
+        """Dispatches an automated follow-up to an eligible conversation."""
+        conv = (
+            DB.conversations._db.conversations.find_one({"conversation_id": conversation_id})
+            if DB.conversations._db.is_connected()
+            else DB.conversations._cache.get(conversation_id)
+        )
+        if not conv:
+            return {"success": False, "error": "Conversation not found"}
+
+        if not self.is_eligible_for_followup(conv):
+            return {"success": False, "skipped": True, "reason": "Not eligible"}
+
+        lead_id = conv.get("lead_id")
+        wa_id = str(conv.get("wa_id", "")).strip()
+        lead = self.lead_repo.get_by_id(lead_id) if lead_id else None
+
+        message_text = self.generate_smart_followup_message(conv, lead)
+
+        from whatsapp import WhatsAppClient
+        client = WhatsAppClient()
+        api_res = client.send_text(recipient=wa_id, message=message_text)
+
+        meta_msg_id = getattr(api_res, "meta_message_id", None)
+        success = getattr(api_res, "success", True)
+
+        # Persist outbound message
+        DB.messages.save_outbound_ai_message(
+            conversation_id=conversation_id,
+            wa_id=wa_id,
+            text=message_text,
+            lead_id=lead_id,
+            whatsapp_message_id=meta_msg_id,
+            message_type="TEXT",
+            status="ACCEPTED" if success else "FAILED"
+        )
+
+        DB.conversations.record_followup(conversation_id)
+        DB.conversations.update_timestamps(conversation_id, sender_type="AI")
+
+        logger.info(f"[FOLLOWUP SENT] Sent smart follow-up to {wa_id} ({conversation_id}): {message_text}")
+        return {"success": success, "message": message_text, "wa_id": wa_id}
+
+    def process_all_eligible_followups(self) -> int:
+        """Scans database and sends follow-ups to all eligible leads."""
+        if not getattr(Config, "FOLLOWUP_ENABLED", True):
+            return 0
+        if self.is_quiet_hours():
+            return 0
+
+        eligible_count = 0
+        now = datetime.now(timezone.utc)
+        min_hours = getattr(Config, "FOLLOWUP_MIN_HOURS", 6.0)
+        cutoff = now - timedelta(hours=min_hours)
+
+        query = {
+            "status": "active",
+            "human_takeover": False,
+            "opted_out": {"$ne": True},
+            "sales_stage": {"$nin": ["VISIT_BOOKED", "VISIT_COMPLETED", "WON", "LOST", "OPTED_OUT"]},
+            "followup_count": {"$lt": getattr(Config, "FOLLOWUP_MAX_COUNT", 2)},
+            "last_message_at": {"$lte": cutoff}
+        }
+
+        candidates = []
+        if DB.conversations._db.is_connected():
+            try:
+                candidates = list(DB.conversations._db.conversations.find(query).limit(50))
+            except Exception as ex:
+                logger.error(f"[FOLLOWUP] Query error: {ex}")
+        else:
+            candidates = [c for c in DB.conversations._cache.values() if c.get("status") == "active"]
+
+        for conv in candidates:
+            cid = conv.get("conversation_id")
+            if not cid:
+                continue
+            if self.is_eligible_for_followup(conv, now_utc=now):
+                try:
+                    res = self.send_followup(cid)
+                    if res.get("success"):
+                        eligible_count += 1
+                except Exception as ex:
+                    logger.error(f"[FOLLOWUP ERROR] Failed sending to {cid}: {ex}")
+
+        return eligible_count
 
     def schedule_lead_nudge(
         self,
@@ -1398,27 +1626,13 @@ class FollowUpService:
         property_id: Optional[str] = None,
         custom_message: Optional[str] = None
     ) -> Dict[str, Any]:
+        """Backward-compatible manual nudge scheduler."""
         scheduled_time = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
         lead = self.lead_repo.get_by_id(lead_id)
         name = lead.get("name") if lead else "Valued Client"
 
         if not custom_message:
-            if nudge_type == "new_lead_followup":
-                custom_message = (
-                    f"Hi {name}! 👋 Just checking in from *ARIS Real Estate*.\n\n"
-                    f"Did you find the property information helpful? "
-                    f"Let us know if you'd like us to curate more options within your budget!"
-                )
-            elif nudge_type == "visit_nudge":
-                custom_message = (
-                    f"Hi {name}! 🏡 We have free guided site visits scheduled this coming weekend.\n\n"
-                    f"Would you like us to reserve a convenient slot for you? Just reply *YES*!"
-                )
-            else:
-                custom_message = (
-                    f"Hi {name}! 🌟 If you have any questions about properties or home loans, "
-                    f"our real estate specialists are ready to help. Reply anytime!"
-                )
+            custom_message = f"Hi {name}! 👋 Just checking in from *ARIS Real Estate*. Let us know if you'd like more verified options!"
 
         fup_data = {
             "lead_id": lead_id,

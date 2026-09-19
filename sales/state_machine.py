@@ -20,6 +20,7 @@ class ConversationSalesStage(str, Enum):
     FOLLOW_UP = "FOLLOW_UP"
     WON = "WON"
     LOST = "LOST"
+    OPTED_OUT = "OPTED_OUT"
 
 
 class SalesStateMachine:
@@ -98,6 +99,11 @@ class SalesStateMachine:
             ConversationSalesStage.NEW,
             ConversationSalesStage.DISCOVERY
         ],
+        ConversationSalesStage.OPTED_OUT: [
+            ConversationSalesStage.NEW,
+            ConversationSalesStage.DISCOVERY,
+            ConversationSalesStage.ENGAGED
+        ],
     }
 
     @classmethod
@@ -105,6 +111,8 @@ class SalesStateMachine:
         try:
             f_val = ConversationSalesStage(from_stage) if not isinstance(from_stage, ConversationSalesStage) else from_stage
             t_val = ConversationSalesStage(to_stage) if not isinstance(to_stage, ConversationSalesStage) else to_stage
+            if t_val == ConversationSalesStage.OPTED_OUT:
+                return True
             return t_val in cls.ALLOWED_TRANSITIONS.get(f_val, [])
         except Exception:
             return False
@@ -155,6 +163,15 @@ class SalesStateMachine:
             stage = str(current_stage or "NEW")
         stage = stage.upper()
         req = customer_requirements or {}
+
+        # 0. Opt-Out intent (highest priority)
+        if intent == "OPT_OUT":
+            return ConversationSalesStage.OPTED_OUT.value, "CUSTOMER_OPTED_OUT"
+
+        if stage == ConversationSalesStage.OPTED_OUT.value:
+            if intent in ("RE_ENGAGE", "RETURNING_GREETING", "DISCOVER_REQUIREMENT", "PRICE_INQUIRY"):
+                return ConversationSalesStage.NEW.value, "OPTED_OUT_CUSTOMER_REENGAGED"
+            return ConversationSalesStage.OPTED_OUT.value, "MAINTAINING_OPTED_OUT"
 
         # 1. Booking confirmed
         if visit_status == "BOOKED":

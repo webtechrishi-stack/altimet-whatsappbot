@@ -31,6 +31,15 @@ class NextBestActionEngine:
         r"\b(?:who are you|who'?s this|who is this|kon ho|kaun ho|aap kaun ho|kon ho aap|aap kon|kahan se bol rahe|kis baare me)\b"
     ]
 
+    OPT_OUT_PATTERNS = [
+        r"\b(?:don'?t (?:message|text|contact|call|msg)|stop (?:messaging|texting|messages|sending)|unsubscribe|leave me alone|do not (?:message|contact|call)|untill? i (?:msg|message|text)|no more messages|stop it)\b",
+        r"\b(?:msg mat karo|message mat bhejo|mat bhejo|nahi chahiye|pareshan mat karo|aage se mat bhejna|ab message mat karna|mat karo message|call mat karo|aage se koi message|message mat karo)\b",
+    ]
+
+    GREETING_PATTERNS = [
+        r"^(?:hi+|hello+|hey+|hii+|hola|namaste|good\s*(?:morning|afternoon|evening))\b"
+    ]
+
     def __init__(self):
         self.objection_engine = ObjectionEngine()
         self.pitch_engine = VisitPitchEngine()
@@ -48,7 +57,8 @@ class NextBestActionEngine:
         Computes structured Next Best Action metadata.
         """
         text = (current_message or "").strip()
-        lower = text.lower()
+        normalized_text = text.replace("’", "'").replace("‘", "'").replace("`", "'")
+        lower = normalized_text.lower()
 
         req = getattr(customer_memory, "requirements", {}) or {}
         bhk = req.get("bhk")
@@ -59,6 +69,46 @@ class NextBestActionEngine:
         stage = getattr(sales_memory, "sales_stage", "NEW")
         v_status = getattr(sales_memory, "visit_status", "NOT_BOOKED")
         recommended = getattr(customer_memory, "recommended_properties", []) or []
+
+        # 0. Detect Opt-Out / DND ("Don't message me", "stop", "mat bhejo")
+        if any(re.search(pat, lower, re.IGNORECASE) for pat in self.OPT_OUT_PATTERNS):
+            return {
+                "intent": "OPT_OUT",
+                "sales_stage": "OPTED_OUT",
+                "lead_temperature": "COLD",
+                "objection": "UNSUBSCRIBE",
+                "visit_readiness": 0,
+                "next_best_action": "CONFIRM_OPT_OUT",
+                "recommended_property": None,
+                "reason_code": "CUSTOMER_REQUESTED_OPT_OUT"
+            }
+
+        # 0b. Detect Re-engagement from previously opted-out customer
+        if stage == "OPTED_OUT":
+            return {
+                "intent": "RE_ENGAGE",
+                "sales_stage": "NEW",
+                "lead_temperature": "WARM",
+                "objection": None,
+                "visit_readiness": 20,
+                "next_best_action": "RE_ENGAGE_WELCOME",
+                "recommended_property": recommended[0] if recommended else None,
+                "reason_code": "OPTED_OUT_CUSTOMER_REENGAGED"
+            }
+
+        # 0c. Detect Casual Greeting mid-conversation (avoid repeated bulky property/cab pitches)
+        is_simple_greeting = any(re.search(pat, lower.strip(), re.IGNORECASE) for pat in self.GREETING_PATTERNS) and len(lower.strip().split()) <= 3
+        if is_simple_greeting and (recommended or stage in ("PROPERTY_RECOMMENDED", "PROPERTY_SHORTLISTED", "VISIT_PITCHED", "ENGAGED")):
+            return {
+                "intent": "RETURNING_GREETING",
+                "sales_stage": stage,
+                "lead_temperature": "WARM",
+                "objection": None,
+                "visit_readiness": visit_readiness_score,
+                "next_best_action": "CASUAL_CHECK_IN",
+                "recommended_property": recommended[0] if recommended else None,
+                "reason_code": "RETURNING_CUSTOMER_GREETING"
+            }
 
         # 1. Detect Identity Query ("Who are you" / "Kon ho aap")
         if any(re.search(pat, lower, re.IGNORECASE) for pat in self.IDENTITY_PATTERNS):

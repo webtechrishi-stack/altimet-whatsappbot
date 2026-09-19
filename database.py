@@ -183,6 +183,9 @@ class Conversation:
     last_customer_message_at: Optional[datetime] = None
     last_ai_message_at: Optional[datetime] = None
     last_human_message_at: Optional[datetime] = None
+    opted_out: bool = False
+    last_followup_at: Optional[datetime] = None
+    followup_count: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -1085,6 +1088,48 @@ class ConversationRepository:
                 c["updated_at"] = now
         return True
 
+    def set_opted_out(self, target: str, opted_out: bool = True) -> bool:
+        if not target:
+            return False
+        now = datetime.now(timezone.utc)
+        updates = {
+            "opted_out": opted_out,
+            "status": "opted_out" if opted_out else "active",
+            "updated_at": now
+        }
+        if self._db.is_connected():
+            try:
+                self._db.conversations.update_many(
+                    {"$or": [{"conversation_id": str(target)}, {"wa_id": str(target)}]},
+                    {"$set": updates}
+                )
+            except Exception:
+                pass
+        for c in self._cache.values():
+            if c.get("conversation_id") == target or c.get("wa_id") == target:
+                c.update(updates)
+        return True
+
+    def record_followup(self, conversation_id: str) -> bool:
+        now = datetime.now(timezone.utc)
+        if self._db.is_connected():
+            try:
+                self._db.conversations.update_one(
+                    {"conversation_id": str(conversation_id)},
+                    {
+                        "$set": {"last_followup_at": now, "updated_at": now},
+                        "$inc": {"followup_count": 1}
+                    }
+                )
+            except Exception:
+                pass
+        for c in self._cache.values():
+            if c.get("conversation_id") == conversation_id:
+                c["last_followup_at"] = now
+                c["updated_at"] = now
+                c["followup_count"] = c.get("followup_count", 0) + 1
+        return True
+
 
 class MessageRepository:
     _cache: List[Dict[str, Any]] = []
@@ -1889,6 +1934,56 @@ class LeadRepository:
                 self._cache[s_lid].update(updates)
                 modified_count = max(modified_count, 1)
         return modified_count
+
+    def opt_out(self, identifier: str) -> bool:
+        """Mark a lead as opted out by wa_id or lead_id."""
+        if not identifier:
+            return False
+        now = datetime.now(timezone.utc)
+        updates = {
+            "opted_out": True,
+            "marketing_opt_in": False,
+            "sales_stage": "OPTED_OUT",
+            "opt_out_date": now,
+            "updated_at": now
+        }
+        if self._db.is_connected():
+            try:
+                self._db.leads.update_many(
+                    {"$or": [{"wa_id": str(identifier)}, {"lead_id": str(identifier)}]},
+                    {"$set": updates}
+                )
+            except Exception:
+                pass
+        for l in self._cache.values():
+            if l.get("wa_id") == identifier or l.get("lead_id") == identifier:
+                l.update(updates)
+        return True
+
+    def opt_in(self, identifier: str) -> bool:
+        """Re-enable marketing and messaging for a lead."""
+        if not identifier:
+            return False
+        now = datetime.now(timezone.utc)
+        updates = {
+            "opted_out": False,
+            "marketing_opt_in": True,
+            "whatsapp_opt_in": True,
+            "sales_stage": "NEW",
+            "updated_at": now
+        }
+        if self._db.is_connected():
+            try:
+                self._db.leads.update_many(
+                    {"$or": [{"wa_id": str(identifier)}, {"lead_id": str(identifier)}]},
+                    {"$set": updates}
+                )
+            except Exception:
+                pass
+        for l in self._cache.values():
+            if l.get("wa_id") == identifier or l.get("lead_id") == identifier:
+                l.update(updates)
+        return True
 
     def get_consent_stats(self) -> Dict[str, int]:
         """Returns counts for opted_in, opted_out, and total leads."""

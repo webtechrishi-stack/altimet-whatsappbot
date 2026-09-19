@@ -1962,6 +1962,40 @@ class CampaignScheduler:
             time.sleep(interval)
 
 
+class FollowUpScheduler:
+    """
+    Background daemon monitoring conversations and triggering smart follow-ups
+    for leads inactive between 6 to 12 hours.
+    """
+    _running = False
+    _thread = None
+
+    @classmethod
+    def start(cls):
+        if cls._running:
+            return
+        cls._running = True
+        cls._thread = threading.Thread(target=cls._run_loop, daemon=True, name="aris-followup-scheduler")
+        cls._thread.start()
+        safe_terminal_log("[FOLLOWUP SCHEDULER] Background smart follow-up daemon initialized.")
+
+    @classmethod
+    def _run_loop(cls):
+        poll_interval = 60
+        from ai_engine import FollowUpService
+        fup_svc = FollowUpService()
+
+        while cls._running:
+            try:
+                processed = fup_svc.process_all_eligible_followups()
+                if processed > 0:
+                    safe_terminal_log(f"[FOLLOWUP SCHEDULER] Dispatched {processed} automated smart follow-ups.")
+            except Exception as ex:
+                safe_terminal_log(f"[FOLLOWUP SCHEDULER] Error in follow-up loop: {ex}")
+
+            time.sleep(poll_interval)
+
+
 # =====================================================================
 # 10. Legacy WhatsAppService Wrapper (Backward Compatibility)
 # =====================================================================

@@ -194,6 +194,31 @@ class PersonalizedSalesAgent:
         lower = text.lower()
         clean_name = customer_name.strip() or "there"
 
+        # 0. Opt-Out / DND request
+        if nba.get("next_best_action") == "CONFIRM_OPT_OUT" or any(w in lower for w in ["don't message", "stop", "mat bhejo", "untill i msg", "nahi chahiye", "msg mat karo"]):
+            reply = (
+                f"Bilkul {clean_name}, maine note kar liya hai! 🙏 "
+                f"Aage se hum aapko koi message nahi karenge jab tak aap khud reach out na karein. "
+                f"Have a great day ahead!"
+            )
+            return reply, session_data
+
+        # 0b. Casual Check-in for returning greeting (avoids repeating full pitch)
+        if nba.get("next_best_action") == "CASUAL_CHECK_IN":
+            reply = (
+                f"Hello {clean_name}! 👋 Great to hear from you. "
+                f"How's everything going? Any questions on what we discussed, ya kuch aur explore karna tha?"
+            )
+            return reply, session_data
+
+        # 0c. Re-engage welcome
+        if nba.get("next_best_action") == "RE_ENGAGE_WELCOME":
+            reply = (
+                f"Hello {clean_name}! 👋 Great to connect with you again! "
+                f"How can I help you with your property search today?"
+            )
+            return reply, session_data
+
         # 1. Explicit menu / reset commands
         if lower in ["menu", "restart", "reset", "help"]:
             return self.deterministic_fallback.process_message(

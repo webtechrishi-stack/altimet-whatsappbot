@@ -69,10 +69,12 @@ from whatsapp import (
     CampaignWorker,
     CampaignService,
     CampaignScheduler,
+    FollowUpScheduler,
     WhatsAppService,
     WhatsAppTemplate,
 )
 from campaign_import import CampaignLeadImporter
+from sales.next_best_action import NextBestActionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +255,24 @@ print("Dashboard URL: /dashboard")
 print("Webhook URL: /webhook")
 print(f"Listening on port: {Config.PORT}")
 print("------------------------------------------------")
+
+# Concurrency locks per sender for rapid message debouncing
+_user_locks: Dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+def _get_user_lock(wa_id: str) -> threading.Lock:
+    with _locks_guard:
+        if wa_id not in _user_locks:
+            _user_locks[wa_id] = threading.Lock()
+        return _user_locks[wa_id]
+
+# Start background daemons (runs under Gunicorn and standalone)
+try:
+    CampaignScheduler.start()
+    FollowUpScheduler.start()
+except Exception as ex:
+    print(f"[SCHEDULER INIT WARNING] Failed starting background daemon: {ex}", flush=True)
+
 
 
 # =====================================================================
@@ -451,95 +471,130 @@ def webhook():
                     print(f"Message Text: {message_text}")
                     print("------------------------------------------------")
 
-                    # Resolve User, Lead, Conversation, Session
-                    user = DB.users.get_or_create(wa_id=sender, profile_name=profile_name)
-                    lead = DB.leads.get_or_create(wa_id=sender, name=profile_name or "Valued Client", phone=sender)
-                    lead_id = lead.get("lead_id")
-                    lead_updates = {"updated_at": datetime.now(timezone.utc)}
-                    if profile_name and lead.get("name") in ("Anonymous", "Valued Client", "", None):
-                        lead_updates["name"] = profile_name
-                    DB.leads.update(lead_id, lead_updates)
-                    conversation = DB.conversations.create_if_not_exists(wa_id=sender, lead_id=lead_id)
-                    conversation_id = conversation.get("conversation_id")
-                    session_data = DB.sessions.get_or_create_session(wa_id=sender)
+                    with _get_user_lock(sender):
+                        # Resolve User, Lead, Conversation, Session
+                        user = DB.users.get_or_create(wa_id=sender, profile_name=profile_name)
+                        lead = DB.leads.get_or_create(wa_id=sender, name=profile_name or "Valued Client", phone=sender)
+                        lead_id = lead.get("lead_id")
+                        lead_updates = {"updated_at": datetime.now(timezone.utc)}
+                        if profile_name and lead.get("name") in ("Anonymous", "Valued Client", "", None):
+                            lead_updates["name"] = profile_name
+                        DB.leads.update(lead_id, lead_updates)
+                        conversation = DB.conversations.create_if_not_exists(wa_id=sender, lead_id=lead_id)
+                        conversation_id = conversation.get("conversation_id")
+                        session_data = DB.sessions.get_or_create_session(wa_id=sender)
 
-                    # PERSIST INBOUND MESSAGE BEFORE AI PROCESSING (Ground Truth)
-                    DB.messages.save_inbound_message(
-                        conversation_id=conversation_id,
-                        wa_id=sender,
-                        text=message_text,
-                        lead_id=lead_id,
-                        user_id=str(user.get("wa_id", sender)),
-                        whatsapp_message_id=meta_message_id,
-                        message_type=message_type,
-                        media=media_payload,
-                        raw_payload=message
-                    )
-                    DB.conversations.increment_message_count(conversation_id, count=1)
-                    DB.conversations.increment_unread(conversation_id, count=1)
-                    DB.conversations.update_last_message(conversation_id)
-                    DB.conversations.update_timestamps(conversation_id, sender_type="CUSTOMER")
-
-                    # Correlate reply with active campaign
-                    try:
-                        matching_rec = DB.campaign_recipients._db.campaign_recipients.find_one(
-                            {"lead_id": str(lead_id), "status": {"$in": ["SENT", "DELIVERED", "READ"]}}
-                        ) if DB.campaign_recipients._db.is_connected() else None
-                        if matching_rec and matching_rec.get("campaign_id"):
-                            DB.campaigns.increment_counter(matching_rec["campaign_id"], "replied_count")
-                    except Exception:
-                        pass
-
-                    # Check for Human Takeover Mode
-                    if conversation.get("human_takeover"):
-                        clean_msg = message_text.strip().lower()
-                        if clean_msg in ("hi", "hii", "hello", "hey", "menu", "start", "restart", "ai", "#ai", "bot", "help"):
-                            print(f"[HUMAN TAKEOVER] User sent '{message_text}' — resuming AI assistant for {conversation_id}.")
-                            DB.conversations.reset_human_takeover(conversation_id)
-                            conversation["human_takeover"] = False
-                        else:
-                            print(f"[HUMAN TAKEOVER] Human agent is in control of {conversation_id}. Skipping automated AI reply.")
-                            continue
-
-                    # Load Recent History for Context
-                    history = DB.messages.get_last_messages(conversation_id=conversation_id, limit=20)
-
-                    # Generate reply via conversational sales engine
-                    reply_text, updated_session = aris_orchestrator.process_message(
-                        sender_id=sender,
-                        profile_name=profile_name,
-                        message_text=message_text,
-                        session=session_data,
-                        history=history,
-                        conversation_id=conversation_id
-                    )
-
-                    if updated_session:
-                        DB.sessions.update_session(
+                        # PERSIST INBOUND MESSAGE BEFORE AI PROCESSING (Ground Truth)
+                        DB.messages.save_inbound_message(
+                            conversation_id=conversation_id,
                             wa_id=sender,
-                            state=updated_session.get("state"),
-                            context=updated_session.get("context")
+                            text=message_text,
+                            lead_id=lead_id,
+                            user_id=str(user.get("wa_id", sender)),
+                            whatsapp_message_id=meta_message_id,
+                            message_type=message_type,
+                            media=media_payload,
+                            raw_payload=message
+                        )
+                        DB.conversations.increment_message_count(conversation_id, count=1)
+                        DB.conversations.increment_unread(conversation_id, count=1)
+                        DB.conversations.update_last_message(conversation_id)
+                        DB.conversations.update_timestamps(conversation_id, sender_type="CUSTOMER")
+
+                        # Correlate reply with active campaign
+                        try:
+                            matching_rec = DB.campaign_recipients._db.campaign_recipients.find_one(
+                                {"lead_id": str(lead_id), "status": {"$in": ["SENT", "DELIVERED", "READ"]}}
+                            ) if DB.campaign_recipients._db.is_connected() else None
+                            if matching_rec and matching_rec.get("campaign_id"):
+                                DB.campaigns.increment_counter(matching_rec["campaign_id"], "replied_count")
+                        except Exception:
+                            pass
+
+                        # Detect Opt-Out / DND Intent & Persist Immediately to MongoDB
+                        clean_inbound = message_text.replace("’", "'").replace("‘", "'").replace("`", "'").lower()
+                        is_opt_out_msg = any(re.search(pat, clean_inbound, re.IGNORECASE) for pat in NextBestActionEngine.OPT_OUT_PATTERNS)
+                        if is_opt_out_msg:
+                            print(f"[OPT OUT DETECTED] Customer {sender} requested DND/Opt-Out: '{message_text}'", flush=True)
+                            DB.leads.opt_out(sender)
+                            DB.conversations.set_opted_out(conversation_id, True)
+                            if DB.followups._db.is_connected():
+                                DB.followups._db.followups.update_many(
+                                    {"wa_id": str(sender), "status": "pending"},
+                                    {"$set": {"status": "cancelled", "cancel_reason": "lead_opted_out"}}
+                                )
+                        elif lead.get("opted_out"):
+                            print(f"[RE-ENGAGE DETECTED] Customer {sender} previously opted out, re-engaging: '{message_text}'", flush=True)
+                            DB.leads.opt_in(sender)
+                            DB.conversations.set_opted_out(conversation_id, False)
+
+                        # Debounce: If customer sent rapid consecutive opt-out messages (e.g. 7s apart) and we already acknowledged, avoid duplicate messages
+                        recent_msgs = DB.messages.get_last_messages(conversation_id=conversation_id, limit=3)
+                        outbound_times = [
+                            m.get("created_at") for m in recent_msgs
+                            if m.get("direction") == "OUTBOUND" and m.get("sender_type") == "AI"
+                        ]
+                        if outbound_times and is_opt_out_msg:
+                            first_out = outbound_times[0]
+                            if isinstance(first_out, str):
+                                try:
+                                    first_out = datetime.fromisoformat(first_out.replace("Z", "+00:00"))
+                                except Exception:
+                                    first_out = None
+                            if first_out and (datetime.now(timezone.utc) - first_out).total_seconds() < 12:
+                                print(f"[DEBOUNCE] Opt-out already acknowledged recently for {sender}. Skipping duplicate reply.", flush=True)
+                                continue
+
+                        # Check for Human Takeover Mode
+                        if conversation.get("human_takeover"):
+                            clean_msg = message_text.strip().lower()
+                            if clean_msg in ("hi", "hii", "hello", "hey", "menu", "start", "restart", "ai", "#ai", "bot", "help"):
+                                print(f"[HUMAN TAKEOVER] User sent '{message_text}' — resuming AI assistant for {conversation_id}.")
+                                DB.conversations.reset_human_takeover(conversation_id)
+                                conversation["human_takeover"] = False
+                            else:
+                                print(f"[HUMAN TAKEOVER] Human agent is in control of {conversation_id}. Skipping automated AI reply.")
+                                continue
+
+                        # Load Recent History for Context
+                        history = DB.messages.get_last_messages(conversation_id=conversation_id, limit=20)
+
+                        # Generate reply via conversational sales engine
+                        reply_text, updated_session = aris_orchestrator.process_message(
+                            sender_id=sender,
+                            profile_name=profile_name,
+                            message_text=message_text,
+                            session=session_data,
+                            history=history,
+                            conversation_id=conversation_id
                         )
 
-                    # Dispatch reply via Meta WhatsApp API
-                    api_resp = whatsapp_client.send_text(recipient=sender, message=reply_text)
-                    meta_out_id = getattr(api_resp, "meta_message_id", None)
-                    is_success = getattr(api_resp, "success", True)
-                    print(f"[WHATSAPP SENT] Success: {is_success} Meta Message ID: {meta_out_id}")
+                        if updated_session:
+                            DB.sessions.update_session(
+                                wa_id=sender,
+                                state=updated_session.get("state"),
+                                context=updated_session.get("context")
+                            )
 
-                    # PERSIST OUTBOUND AI MESSAGE
-                    DB.messages.save_outbound_ai_message(
-                        conversation_id=conversation_id,
-                        wa_id=sender,
-                        text=reply_text,
-                        lead_id=lead_id,
-                        whatsapp_message_id=meta_out_id,
-                        message_type="TEXT",
-                        status="ACCEPTED" if is_success else "FAILED"
-                    )
-                    DB.conversations.increment_message_count(conversation_id, count=1)
-                    DB.conversations.update_last_message(conversation_id)
-                    DB.conversations.update_timestamps(conversation_id, sender_type="AI")
+                        # Dispatch reply via Meta WhatsApp API
+                        api_resp = whatsapp_client.send_text(recipient=sender, message=reply_text)
+                        meta_out_id = getattr(api_resp, "meta_message_id", None)
+                        is_success = getattr(api_resp, "success", True)
+                        print(f"[WHATSAPP SENT] Success: {is_success} Meta Message ID: {meta_out_id}")
+
+                        # PERSIST OUTBOUND AI MESSAGE
+                        DB.messages.save_outbound_ai_message(
+                            conversation_id=conversation_id,
+                            wa_id=sender,
+                            text=reply_text,
+                            lead_id=lead_id,
+                            whatsapp_message_id=meta_out_id,
+                            message_type="TEXT",
+                            status="ACCEPTED" if is_success else "FAILED"
+                        )
+                        DB.conversations.increment_message_count(conversation_id, count=1)
+                        DB.conversations.update_last_message(conversation_id)
+                        DB.conversations.update_timestamps(conversation_id, sender_type="AI")
 
     except Exception as ex:
         print(f"[ERROR] Webhook processing exception [{request_id}]: {ex}")
@@ -1991,11 +2046,12 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Start background campaign scheduler
+    # Start background campaign and follow-up schedulers
     try:
         CampaignScheduler.start()
+        FollowUpScheduler.start()
     except Exception as ex:
-        print(f"[CAMPAIGN SCHEDULER ERROR] Failed to start daemon: {ex}")
+        print(f"[SCHEDULER ERROR] Failed to start daemon: {ex}")
 
     app.run(
         host="0.0.0.0",
